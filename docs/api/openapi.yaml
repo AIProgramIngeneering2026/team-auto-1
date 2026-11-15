@@ -28,6 +28,10 @@ info:
     * **Повторные попытки не меняют статус**: Job остаётся `sending`, счётчик `attempts`
       растёт (до 3 попыток). Постоянная ошибка канала (адрес не существует, бот заблокирован) —
       сразу `undelivered` без повторов; неразборчивый ответ канала считается неудачной попыткой.
+    * Причина недоставки — поле `error` с кодом из контракта Tool (`docs/tool-contract.md`,
+      раздел 2): `provider_timeout`, `provider_unavailable`, `rate_limited`,
+      `bad_provider_response`, `recipient_rejected`, `invalid_params`, `interrupted`,
+      `internal_error`.
     * При перезапуске сервиса Job в `sending` переводится в `undelivered` с
       `error.code = interrupted`. Гарантия доставки — не меньше одного раза: после `interrupted`
       ручной повтор может дать дубль, «ровно один раз» сервис не гарантирует.
@@ -461,16 +465,24 @@ components:
       enum: [accepted, sending, delivered, undelivered, cancelled]
     FailureReason:
       type: object
-      description: Причина, по которой Job не доставлен; присутствует только в состоянии `undelivered`.
+      description: |
+        Причина, по которой Job не доставлен; присутствует только в состоянии `undelivered`.
+        Полный список кодов совпадает с контрактом Tool (`docs/tool-contract.md`, раздел 2).
       required: [code, message]
       properties:
         code:
           type: string
           description: |
-            Машиночитаемая причина: `provider_timeout` — таймаут канала, попытки исчерпаны;
-            `provider_rejected` — постоянная ошибка канала (адрес не существует, бот заблокирован);
-            `interrupted` — сервис перезапущен во время отправки.
-          enum: [provider_timeout, provider_rejected, interrupted]
+            Машиночитаемая причина недоставки:
+            `provider_timeout` — канал не ответил за таймаут, попытки исчерпаны;
+            `provider_unavailable` — сеть недоступна или 5xx провайдера, попытки исчерпаны;
+            `rate_limited` — провайдер отвечал 429, попытки исчерпаны;
+            `bad_provider_response` — ответ канала не удалось разобрать, попытки исчерпаны;
+            `recipient_rejected` — постоянная ошибка канала (адрес не существует, бот заблокирован);
+            `invalid_params` — параметры не прошли защитную проверку исполнителя внутри `send()`;
+            `interrupted` — сервис перезапущен во время отправки;
+            `internal_error` — последняя попытка упала из-за ошибки в исполнителе.
+          enum: [provider_timeout, provider_unavailable, rate_limited, bad_provider_response, recipient_rejected, invalid_params, interrupted, internal_error]
         message:
           type: string
           description: Человекочитаемое пояснение.
