@@ -179,6 +179,10 @@ stateDiagram-v2
     WINDOW --> CANCELLED : отмена до старта
     RUNNING --> COMPLETED : все уведомления терминальны
     RUNNING --> FAILED : неисправимая системная ошибка
+    REJECTED --> [*]
+    CANCELLED --> [*]
+    COMPLETED --> [*]
+    FAILED --> [*]
 ```
 
 ![Диаграмма состояний Job](assets/job-states.png)
@@ -249,6 +253,9 @@ stateDiagram-v2
     SND --> RTW : ошибка канала
     RTW --> SND : пауза истекла
     SND --> UDL : повторы исчерпаны
+    DLV --> [*]
+    UDL --> [*]
+    CNC --> [*]
 ```
 
 ![Диаграмма состояний уведомления](assets/notification-states.png)
