@@ -5,51 +5,56 @@ info:
   license:
     name: Proprietary
   description: |
-    Контракт HTTP API сервиса массовых рассылок уведомлений (первая версия).
+    Контракт HTTP API сервиса уведомлений (первая версия).
 
-    Сервис принимает запрос на рассылку (канал, шаблон, получатели, время запуска),
-    планирует отправку по расписанию и разрешённым окнам, подставляет персональные
-    данные в шаблон, отправляет уведомления по каналам email / telegram / webhook
-    с ограниченными повторами и ведёт статус каждого уведомления.
+    Единица работы — Job, **одно уведомление** (решение зафиксировано в
+    `docs/adr/ADR-0001-job-is-a-single-notification.md`). Сервис принимает запрос
+    на отправку одного сообщения (канал, получатель, текст), доставляет его по каналу
+    email / telegram / webhook, ведёт статус, повторяет временные ошибки канала
+    до 3 попыток и поддерживает идемпотентность создания.
 
     Ключевые правила API:
 
-    * **Валидация входных данных выполняется синхронно** при создании Job:
-      успех — `201` и Job сразу в состоянии `scheduled`; неудача — `422`,
-      Job сохраняется в состоянии `rejected` для аудита, его `id` возвращается
-      в теле ошибки.
-    * **Отмена (`DELETE /jobs/{jobId}`) разрешена только до начала отправки** —
-      в состояниях `scheduled` и `waiting_window`. В `running` и терминальных
-      состояниях ответ `409`.
-    * **Job неизменяем после создания** (методов изменения нет). Нужны другие
-      параметры — отмените Job и создайте новый. Перезапуск `failed`/`completed`
-      Job не поддерживается — создаётся новый Job.
-    * Статусы Job: `created`, `rejected`, `scheduled`, `waiting_window`, `running`,
-      `completed`, `failed`, `cancelled` (полная машина состояний — `docs/architecture.md`).
-    * Статусы уведомления: `accepted`, `sending`, `delivered`, `undelivered`,
-      `cancelled`.
+    * **Валидация входных данных выполняется синхронно до создания Job**: ошибка — `400`,
+      Job не создаётся вообще.
+    * **`Idempotency-Key` обязателен** при создании. Повтор того же запроса с тем же ключом —
+      `200` и прежний `id`, новый Job не создаётся, сообщение повторно не отправляется.
+      Тот же ключ с другим телом — `409 idempotency_conflict`.
+    * **Отмена (`POST /notifications/{id}/cancel`) разрешена только из `accepted`**; из
+      `sending` и терминальных состояний — `409 cannot_cancel`. Переход атомарный: при гонке
+      с запуском отправки выполняется ровно одно из двух.
+    * Статусы Job: `accepted`, `sending`, `delivered`, `undelivered`, `cancelled`
+      (полная машина состояний — `docs/architecture.md`).
+    * **Повторные попытки не меняют статус**: Job остаётся `sending`, счётчик `attempts`
+      растёт (до 3 попыток). Постоянная ошибка канала (адрес не существует, бот заблокирован) —
+      сразу `undelivered` без повторов; неразборчивый ответ канала считается неудачной попыткой.
+    * При перезапуске сервиса Job в `sending` переводится в `undelivered` с
+      `error.code = interrupted`. Гарантия доставки — не меньше одного раза: после `interrupted`
+      ручной повтор может дать дубль, «ровно один раз» сервис не гарантирует.
 
     ### Единый формат ошибок
 
-    Любая ошибка — один и тот же объект `Error`: HTTP-код, машиночитаемый `code`,
-    человекочитаемый `message`, а для ошибок валидации — список `details`
-    с указанием, **какое поле не так** и что с ним не так.
+    Любая ошибка — один и тот же объект `Error`: машиночитаемый `code`, человекочитаемый
+    `message`, а для `invalid_params` — список `details` с указанием, **какое поле не так**
+    и что с ним не так.
 
     | HTTP | `code` | Когда возвращается |
     |------|--------|--------------------|
-    | 400 | `bad_request` | тело не парсится как JSON или поле имеет неверный тип (в `details` — поле) |
-    | 404 | `not_found` | Job или уведомление не найдены |
-    | 409 | `job_is_running` | попытка отменить Job, который уже отправляется |
-    | 409 | `job_in_terminal_state` | попытка отменить завершённый/отменённый/сбойный/отклонённый Job; в `state` — текущее состояние |
-    | 422 | `validation_failed` | нарушены бизнес-правила входных данных; в `details` — каждое некорректное поле |
+    | 400 | `bad_request` | тело не парсится как JSON |
+    | 400 | `unknown_channel` | канал не поддерживается (например, `sms2`) |
+    | 400 | `invalid_params` | пустой текст или получатель неподходящего формата для канала (`details.field`) |
+    | 400 | `missing_idempotency_key` | запрос без заголовка `Idempotency-Key` |
+    | 404 | `notification_not_found` | уведомление не найдено |
+    | 409 | `cannot_cancel` | отмена Job не из состояния `accepted` |
+    | 409 | `idempotency_conflict` | тот же `Idempotency-Key`, но другое тело запроса |
     | 500 | `internal_error` | непредвиденная ошибка сервиса |
 
-    CLI-клиент повторяет операции этого контракта один к одному (create / status /
-    cancel / список уведомлений); схемы тел запросов и ответов совпадают.
+    CLI-клиент повторяет операции этого контракта один к одному (create / status / cancel);
+    схемы тел запросов и ответов совпадают.
 
     Аутентификация и авторизация в первую версию не входят, поэтому API явно
-    объявлен открытым (`security: []` на корне). Перед продуктивным
-    развёртыванием сюда добавляется схема аутентификации.
+    объявлен открытым (`security: []` на корне). Перед продуктивным развёртыванием сюда
+    добавляется схема аутентификации.
 
     В первой версии вызовы внешних провайдеров заменены тестовой заглушкой:
     контракт и коды ответов при этом не меняются.
@@ -58,758 +63,479 @@ servers:
     description: Базовый префикс API сервиса
 security: []
 tags:
-  - name: jobs
-    description: "Рассылки (Job): создание, статус, отмена"
   - name: notifications
-    description: Отдельные уведомления внутри Job и их статусы
+    description: "Уведомления (Job): создание, статус, отмена"
   - name: service
     description: Служебные операции (проверка живости для CI и Docker Compose)
 paths:
-  /jobs:
+  /notifications:
     post:
-      tags: [jobs]
-      operationId: createJob
-      summary: Создать рассылку (Job)
+      tags: [notifications]
+      operationId: createNotification
+      summary: Отправить уведомление (создать Job)
       description: |
-        Принимает параметры рассылки, синхронно валидирует входные данные и
-        сохраняет Job.
+        Принимает канал, получателя и текст; синхронно проверяет данные **до создания Job**.
 
-        * `201` — валидация пройдена, Job запланирован (`state = scheduled`),
-          отправка начнётся в `scheduled_at` с учётом окна отправки.
-        * `422` — валидация не пройдена; Job сохранён в состоянии `rejected`
-          для аудита, его `id` приходит в теле ошибки (`job_id`).
+        * `202` — валидация пройдена, Job создан в состоянии `accepted`, отправка начнётся
+          сразу, без планирования.
+        * `200` — идемпотентный повтор: тот же `Idempotency-Key` и то же тело, возвращается
+          ранее созданный Job (его состояние могло продвинуться), новый Job не создаётся.
+        * `409 idempotency_conflict` — тот же `Idempotency-Key`, но другое тело.
+        * `400` — невалидные данные, Job не создаётся.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: |
+            Ключ идемпотентности. Придумывается клиентом и уникален для каждого логического
+            запроса. Первый запрос с ключом создаёт Job; повтор того же запроса возвращает
+            уже созданный Job; тот же ключ с другим телом отклоняется.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+          examples:
+            новыйЗапрос:
+              summary: Ключ нового уведомления
+              value: order-42-shipped
+            повторИз-заПотерянногоОтвета:
+              summary: Тот же ключ при повторе запроса
+              value: order-42-shipped
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/JobCreate'
+              $ref: '#/components/schemas/NotificationCreate'
             examples:
-              emailРассылкаНаСубботу:
-                summary: Email-рассылка в субботу 10:00 с окном отправки
+              email:
+                summary: Письмо на email
                 value:
                   channel: email
-                  template:
-                    subject: "Здравствуйте, {{name}}!"
-                    body: "{{name}}, ваш заказ {{order_id}} собран."
-                  recipients:
-                    - contact: "user1@example.com"
-                      variables: { name: "Иван", order_id: "A-101" }
-                    - contact: "user2@example.com"
-                      variables: { name: "Мария", order_id: "A-102" }
-                  scheduled_at: "2026-11-21T10:00:00+03:00"
-                  send_window: { start: "09:00", end: "21:00", timezone: "Europe/Moscow" }
-                  retry_policy: { max_attempts: 3, backoff_seconds: 60 }
-              webhookНемедленно:
-                summary: Webhook-уведомление, отправить как можно скорее
+                  recipient: "user@example.com"
+                  text: "Здравствуйте! Ваш заказ A-101 собран и передан в доставку."
+              telegram:
+                summary: Сообщение в Telegram
+                value:
+                  channel: telegram
+                  recipient: "987654321"
+                  text: "Здравствуйте! Ваш заказ A-101 собран и передан в доставку."
+              webhook:
+                summary: POST-уведомление на webhook клиента
                 value:
                   channel: webhook
-                  template:
-                    body: "{\"event\": \"order.shipped\", \"order_id\": \"{{order_id}}\"}"
-                  recipients:
-                    - contact: "https://client.example.com/hooks/orders"
-                      variables: { order_id: "A-101" }
+                  recipient: "https://client.example.com/hooks/orders"
+                  text: "{\"event\": \"order.shipped\", \"order_id\": \"A-101\"}"
       responses:
-        '201':
-          description: Job создан и запланирован; тело — созданный Job
+        '202':
+          description: Job создан в состоянии accepted; тело — созданный Job
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Job'
+                $ref: '#/components/schemas/Notification'
               examples:
-                scheduled:
+                принят:
+                  summary: Валидный запрос, Job принят
                   value:
-                    id: "0f1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f80"
-                    state: scheduled
+                    id: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+                    state: accepted
                     channel: email
-                    scheduled_at: "2026-11-21T10:00:00+03:00"
-                    send_window: { start: "09:00", end: "21:00", timezone: "Europe/Moscow" }
-                    retry_policy: { max_attempts: 3, backoff_seconds: 60 }
+                    recipient: "user@example.com"
+                    attempts: 0
                     created_at: "2026-11-15T12:00:00+03:00"
                     updated_at: "2026-11-15T12:00:00+03:00"
-                    stats: { total: 2, accepted: 2, sending: 0, delivered: 0, undelivered: 0, cancelled: 0 }
-        '400':
-          description: Тело не парсится как JSON или поле имеет неверный тип
+        '200':
+          description: |
+            Идемпотентный повтор: тот же Idempotency-Key и то же тело. Возвращается ранее
+            созданный Job — его состояние могло продвинуться с момента первого ответа.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/Notification'
               examples:
-                неверныйТип:
+                повтор:
+                  summary: Повтор запроса, Job уже отправляется
                   value:
-                    code: bad_request
-                    message: "Тело запроса не соответствует схеме"
-                    details:
-                      - { field: "recipients", issue: "expected array, got string" }
-        '422':
+                    id: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+                    state: sending
+                    channel: email
+                    recipient: "user@example.com"
+                    attempts: 1
+                    created_at: "2026-11-15T12:00:00+03:00"
+                    updated_at: "2026-11-15T12:00:05+03:00"
+        '400':
           description: |
-            Валидация не пройдена. `details` перечисляет каждое некорректное поле.
-            Job сохранён в состоянии `rejected`, его id — в `job_id`.
+            Невалидный запрос; Job не создаётся. Коды: `unknown_channel`,
+            `invalid_params` (в `details` — поле), `missing_idempotency_key`,
+            `bad_request` (тело не парсится).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
               examples:
                 неизвестныйКанал:
-                  summary: Неверное значение enum
+                  summary: 400 unknown_channel
                   value:
-                    code: validation_failed
-                    message: "Входные данные не прошли валидацию"
-                    job_id: "5a1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f90"
+                    code: unknown_channel
+                    message: "канал 'sms2' не поддерживается; доступны: email, telegram, webhook"
+                пустойТекст:
+                  summary: 400 invalid_params, указано поле
+                  value:
+                    code: invalid_params
+                    message: "параметры запроса некорректны"
                     details:
-                      - { field: "channel", issue: "must be one of: email, telegram, webhook" }
-                плохойАдресПолучателя:
-                  summary: Контакт не соответствует каналу
+                      - field: text
+                        issue: "не может быть пустым"
+                получательНеПодходитКаналу:
+                  summary: 400 invalid_params, получатель не подходит каналу
                   value:
-                    code: validation_failed
-                    message: "Входные данные не прошли валидацию"
-                    job_id: "5a1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f91"
+                    code: invalid_params
+                    message: "параметры запроса некорректны"
                     details:
-                      - { field: "recipients[3].contact", issue: "must be a valid email address for channel=email" }
-                нетТемыПисьма:
-                  summary: Обязательное поле шаблона для email отсутствует
+                      - field: recipient
+                        issue: "для канала email ожидается адрес вида user@example.com"
+                нетКлючаИдемпотентности:
+                  summary: 400 missing_idempotency_key
                   value:
-                    code: validation_failed
-                    message: "Входные данные не прошли валидацию"
-                    job_id: "5a1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f92"
-                    details:
-                      - { field: "template.subject", issue: "required when channel=email" }
-                времяВПрошлом:
-                  summary: Время запуска задано в прошлом
-                  value:
-                    code: validation_failed
-                    message: "Входные данные не прошли валидацию"
-                    job_id: "5a1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f93"
-                    details:
-                      - { field: "scheduled_at", issue: "must be in the future" }
-                пустойСписокПолучателей:
-                  summary: Список получателей пуст
-                  value:
-                    code: validation_failed
-                    message: "Входные данные не прошли валидацию"
-                    job_id: "5a1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f94"
-                    details:
-                      - { field: "recipients", issue: "must contain at least 1 recipient" }
-        '500':
-          $ref: '#/components/responses/InternalError'
-
-  /jobs/{jobId}:
-    parameters:
-      - $ref: '#/components/parameters/JobId'
-    get:
-      tags: [jobs]
-      operationId: getJob
-      summary: Получить статус Job
-      description: |
-        Разрешено в любом состоянии, само состояние не меняет. В `stats` — счётчики
-        уведомлений по статусам, в `failure` — причина, если Job завершился сбоем.
-      responses:
-        '200':
-          description: Текущее состояние Job
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Job'
-              examples:
-                отправляется:
-                  summary: Job в процессе отправки
-                  value:
-                    id: "0f1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f80"
-                    state: running
-                    channel: email
-                    scheduled_at: "2026-11-21T10:00:00+03:00"
-                    send_window: { start: "09:00", end: "21:00", timezone: "Europe/Moscow" }
-                    retry_policy: { max_attempts: 3, backoff_seconds: 60 }
-                    created_at: "2026-11-15T12:00:00+03:00"
-                    updated_at: "2026-11-21T10:04:12+03:00"
-                    stats: { total: 2, accepted: 0, sending: 1, delivered: 1, undelivered: 0, cancelled: 0 }
-                завершён:
-                  summary: Завершённый Job с недоставленными уведомлениями
-                  value:
-                    id: "0f1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f80"
-                    state: completed
-                    channel: email
-                    scheduled_at: "2026-11-21T10:00:00+03:00"
-                    send_window: { start: "09:00", end: "21:00", timezone: "Europe/Moscow" }
-                    retry_policy: { max_attempts: 3, backoff_seconds: 60 }
-                    created_at: "2026-11-15T12:00:00+03:00"
-                    updated_at: "2026-11-21T10:06:40+03:00"
-                    stats: { total: 2, accepted: 0, sending: 0, delivered: 1, undelivered: 1, cancelled: 0 }
-                сбой:
-                  summary: Job, прерванный системной ошибкой
-                  value:
-                    id: "0f1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f81"
-                    state: failed
-                    channel: email
-                    scheduled_at: "2026-11-21T10:00:00+03:00"
-                    send_window: { start: "09:00", end: "21:00", timezone: "Europe/Moscow" }
-                    retry_policy: { max_attempts: 3, backoff_seconds: 60 }
-                    created_at: "2026-11-15T12:00:00+03:00"
-                    updated_at: "2026-11-21T10:08:02+03:00"
-                    stats: { total: 2, accepted: 2, sending: 0, delivered: 0, undelivered: 0, cancelled: 0 }
-                    failure: { code: "storage_unavailable", message: "Хранилище недоступно дольше допустимого предела" }
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '500':
-          $ref: '#/components/responses/InternalError'
-    delete:
-      tags: [jobs]
-      operationId: cancelJob
-      summary: Отменить Job (только до начала отправки)
-      description: |
-        Разрешено в состояниях `scheduled` и `waiting_window`; все ещё не
-        отправленные уведомления переходят в статус `cancelled`.
-
-        * `running` — `409 job_is_running`: отправка уже началась, отмена недоступна.
-        * `completed` / `failed` / `cancelled` / `rejected` — `409 job_in_terminal_state`.
-      responses:
-        '200':
-          description: Job отменён; тело — Job в состоянии `cancelled`
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Job'
-              examples:
-                отменён:
-                  value:
-                    id: "0f1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f80"
-                    state: cancelled
-                    channel: email
-                    scheduled_at: "2026-11-21T10:00:00+03:00"
-                    send_window: { start: "09:00", end: "21:00", timezone: "Europe/Moscow" }
-                    retry_policy: { max_attempts: 3, backoff_seconds: 60 }
-                    created_at: "2026-11-15T12:00:00+03:00"
-                    updated_at: "2026-11-15T12:30:00+03:00"
-                    stats: { total: 2, accepted: 0, sending: 0, delivered: 0, undelivered: 0, cancelled: 2 }
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '409':
-          description: "Отмена недоступна: Job уже отправляется или в терминальном состоянии"
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              examples:
-                отправляется:
-                  summary: Отправка уже началась
-                  value:
-                    code: job_is_running
-                    message: "Job is running, cancellation allowed only before start"
-                    state: running
-                терминальное:
-                  summary: Job уже завершён
-                  value:
-                    code: job_in_terminal_state
-                    message: "Job is already in terminal state"
-                    state: completed
-        '500':
-          $ref: '#/components/responses/InternalError'
-
-  /jobs/{jobId}/notifications:
-    parameters:
-      - $ref: '#/components/parameters/JobId'
-    get:
-      tags: [notifications]
-      operationId: listNotifications
-      summary: Список уведомлений Job со статусами
-      description: |
-        Постраничный список уведомлений Job с их текущими статусами.
-        Фильтр по статусу обязателен только если нужны конкретные статусы
-        (например, все `undelivered` после завершения Job).
-      parameters:
-        - name: status
-          in: query
-          required: false
-          description: Фильтр по статусу уведомления
-          schema:
-            $ref: '#/components/schemas/NotificationStatus'
-        - name: limit
-          in: query
-          required: false
-          description: Размер страницы
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 500
-            default: 100
-        - name: offset
-          in: query
-          required: false
-          description: Смещение страницы
-          schema:
-            type: integer
-            minimum: 0
-            default: 0
-      responses:
-        '200':
-          description: Страница списка уведомлений
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/NotificationList'
-              examples:
-                всеУведомления:
-                  value:
-                    total: 2
-                    items:
-                      - id: "c41d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7fa0"
-                        job_id: "0f1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f80"
-                        status: delivered
-                        contact: "user1@example.com"
-                        attempts: 1
-                        last_attempt_at: "2026-11-21T10:00:05+03:00"
-                        delivered_at: "2026-11-21T10:00:06+03:00"
-                      - id: "c41d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7fa1"
-                        job_id: "0f1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f80"
-                        status: undelivered
-                        contact: "user2@example.com"
-                        attempts: 3
-                        last_attempt_at: "2026-11-21T10:06:39+03:00"
-                        failure: { code: "provider_rejected", message: "Провайдер вернул постоянную ошибку" }
-        '400':
-          description: Неверные параметры запроса (в `details` — какой параметр не так)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              examples:
-                пределСтраницы:
+                    code: missing_idempotency_key
+                    message: "заголовок Idempotency-Key обязателен"
+                битыйJson:
+                  summary: 400 bad_request
                   value:
                     code: bad_request
-                    message: "Неверные параметры запроса"
-                    details:
-                      - { field: "limit", issue: "must be between 1 and 500" }
-        '404':
-          $ref: '#/components/responses/NotFound'
+                    message: "тело запроса не является корректным JSON"
+        '409':
+          description: Тот же Idempotency-Key, но другое тело запроса; Job не создаётся.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                конфликтИдемпотентности:
+                  summary: 409 idempotency_conflict
+                  value:
+                    code: idempotency_conflict
+                    message: "Idempotency-Key уже использован с другим телом запроса"
         '500':
-          $ref: '#/components/responses/InternalError'
-
-  /jobs/{jobId}/notifications/{notificationId}:
-    parameters:
-      - $ref: '#/components/parameters/JobId'
-      - $ref: '#/components/parameters/NotificationId'
+          description: Непредвиденная ошибка сервиса.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                внутренняяОшибка:
+                  value:
+                    code: internal_error
+                    message: "непредвиденная ошибка сервиса"
+  /notifications/{id}:
     get:
       tags: [notifications]
       operationId: getNotification
-      summary: Получить статус одного уведомления
-      description: Возвращает текущий статус, число попыток и причину неудачи, если уведомление не доставлено.
+      summary: Узнать статус уведомления
+      description: |
+        Возвращает состояние Job, число попыток `attempts` и причину неудачи `error`,
+        если она есть. Разрешено в любом состоянии, состояние не меняет.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Идентификатор Job, возвращённый при создании.
+          schema:
+            type: string
+            format: uuid
       responses:
         '200':
-          description: Уведомление
+          description: Текущее состояние Job.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Notification'
               examples:
+                принято:
+                  summary: Принято, отправка ещё не начиналась
+                  value:
+                    id: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+                    state: accepted
+                    channel: email
+                    recipient: "user@example.com"
+                    attempts: 0
+                    created_at: "2026-11-15T12:00:00+03:00"
+                    updated_at: "2026-11-15T12:00:00+03:00"
+                отправляется:
+                  summary: Отправляется, была одна неудачная попытка
+                  value:
+                    id: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+                    state: sending
+                    channel: email
+                    recipient: "user@example.com"
+                    attempts: 1
+                    created_at: "2026-11-15T12:00:00+03:00"
+                    updated_at: "2026-11-15T12:00:07+03:00"
                 доставлено:
+                  summary: Канал подтвердил приём
                   value:
-                    id: "c41d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7fa0"
-                    job_id: "0f1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f80"
-                    status: delivered
-                    contact: "user1@example.com"
+                    id: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+                    state: delivered
+                    channel: email
+                    recipient: "user@example.com"
                     attempts: 1
-                    last_attempt_at: "2026-11-21T10:00:05+03:00"
-                    delivered_at: "2026-11-21T10:00:06+03:00"
-                ожиданиеПовтора:
-                  summary: Уведомление в внутренней фазе повтора; наружу отдаётся как sending
+                    created_at: "2026-11-15T12:00:00+03:00"
+                    updated_at: "2026-11-15T12:00:03+03:00"
+                неДоставлено:
+                  summary: Попытки исчерпаны, причина в error
                   value:
-                    id: "c41d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7fa1"
-                    job_id: "0f1d2b6c-9f0a-4c1d-8e2a-3b4c5d6e7f80"
-                    status: sending
-                    contact: "user2@example.com"
-                    attempts: 1
-                    last_attempt_at: "2026-11-21T10:01:05+03:00"
+                    id: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+                    state: undelivered
+                    channel: email
+                    recipient: "user@example.com"
+                    attempts: 3
+                    error:
+                      code: provider_timeout
+                      message: "канал не ответил за таймаут, попытки исчерпаны"
+                    created_at: "2026-11-15T12:00:00+03:00"
+                    updated_at: "2026-11-15T12:03:00+03:00"
+                отменено:
+                  summary: Клиент отменил до начала отправки
+                  value:
+                    id: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+                    state: cancelled
+                    channel: email
+                    recipient: "user@example.com"
+                    attempts: 0
+                    created_at: "2026-11-15T12:00:00+03:00"
+                    updated_at: "2026-11-15T12:00:02+03:00"
         '404':
-          description: Job или уведомление не найдены
+          description: Job с таким id не найден.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
               examples:
-                нетУведомления:
+                найденоВсё:
+                  summary: 404 notification_not_found
                   value:
-                    code: not_found
-                    message: "Notification not found"
+                    code: notification_not_found
+                    message: "уведомление не найдено"
         '500':
-          $ref: '#/components/responses/InternalError'
-
+          description: Непредвиденная ошибка сервиса.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                внутренняяОшибка:
+                  value:
+                    code: internal_error
+                    message: "непредвиденная ошибка сервиса"
+  /notifications/{id}/cancel:
+    post:
+      tags: [notifications]
+      operationId: cancelNotification
+      summary: Отменить уведомление
+      description: |
+        Разрешён только из состояния `accepted` — до начала отправки. Из `sending`
+        и терминальных состояний — `409 cannot_cancel`. Переход атомарный: если отмена
+        пришла одновременно с запуском отправки, выполняется ровно одно из двух.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Идентификатор Job.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Отмена выполнена, сообщение не отправляется.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Notification'
+              examples:
+                отменено:
+                  summary: 200, Job перешёл в cancelled
+                  value:
+                    id: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+                    state: cancelled
+                    channel: email
+                    recipient: "user@example.com"
+                    attempts: 0
+                    created_at: "2026-11-15T12:00:00+03:00"
+                    updated_at: "2026-11-15T12:00:02+03:00"
+        '404':
+          description: Job с таким id не найден.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                не найдено:
+                  summary: 404 notification_not_found
+                  value:
+                    code: notification_not_found
+                    message: "уведомление не найдено"
+        '409':
+          description: "Отмена невозможна: Job уже отправляется или находится в терминальном состоянии."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                отправляется:
+                  summary: 409 cannot_cancel, отправка уже началась
+                  value:
+                    code: cannot_cancel
+                    message: "отмена невозможна: отправка уже началась"
+                терминальное:
+                  summary: 409 cannot_cancel, Job уже завершён
+                  value:
+                    code: cannot_cancel
+                    message: "отмена невозможна: уведомление уже доставлено"
+        '500':
+          description: Непредвиденная ошибка сервиса.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                внутренняяОшибка:
+                  value:
+                    code: internal_error
+                    message: "непредвиденная ошибка сервиса"
   /healthz:
     get:
       tags: [service]
-      operationId: getHealth
-      summary: Проверка живости
-      description: |
-        Для Docker Compose healthcheck, CI и балансировщика. Семантика кодов
-        стандартная для health-эндпоинтов: 2xx — сервис жив и работоспособен,
-        503 — процесс отвечает, но сервис неработоспособен (зависимости недоступны).
+      operationId: healthCheck
+      summary: Проверка живости сервиса
+      description: Используется CI и Docker Compose; на бизнес-операции не влияет.
       responses:
         '200':
-          description: Сервис жив
+          description: Сервис жив.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Health'
+                $ref: '#/components/schemas/HealthStatus'
               examples:
-                ok:
-                  value: { status: "ok", version: "1.0.0" }
+                ок:
+                  value:
+                    status: ok
         '503':
-          description: Сервис деградировал — процесс отвечает, но внутренние зависимости недоступны
+          description: Сервис не готов принимать запросы.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Health'
+                $ref: '#/components/schemas/HealthStatus'
               examples:
                 деградация:
-                  value: { status: "degraded", version: "1.0.0" }
-
+                  value:
+                    status: degraded
 components:
-  parameters:
-    JobId:
-      name: jobId
-      in: path
-      required: true
-      description: Идентификатор Job (UUID)
-      schema:
-        type: string
-        format: uuid
-    NotificationId:
-      name: notificationId
-      in: path
-      required: true
-      description: Идентификатор уведомления (UUID)
-      schema:
-        type: string
-        format: uuid
-
-  responses:
-    NotFound:
-      description: Ресурс не найден
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/Error'
-          examples:
-            нетJob:
-              value:
-                code: not_found
-                message: "Job not found"
-    InternalError:
-      description: Непредвиденная ошибка сервиса
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/Error'
-          examples:
-            внутренняя:
-              value:
-                code: internal_error
-                message: "Внутренняя ошибка сервиса"
-
   schemas:
     Channel:
       type: string
-      description: Канал доставки уведомления
+      description: Канал доставки; других каналов в v1 нет.
       enum: [email, telegram, webhook]
-
-    JobState:
-      type: string
-      description: |
-        Состояние Job. Терминальные: `rejected`, `cancelled`, `completed`, `failed`.
-        Машина состояний целиком — в `docs/architecture.md`.
-      enum: [created, rejected, scheduled, waiting_window, running, completed, failed, cancelled]
-
-    NotificationStatus:
-      type: string
-      description: |
-        Внешний статус уведомления. Ожидание повтора — внутренняя фаза,
-        наружу отдаётся как `sending`.
-      enum: [accepted, sending, delivered, undelivered, cancelled]
-
-    ErrorCode:
-      type: string
-      description: Машиночитаемый код ошибки; каталог — в описании API
-      enum: [bad_request, validation_failed, not_found, job_is_running, job_in_terminal_state, internal_error]
-
-    FieldError:
+    NotificationCreate:
       type: object
-      description: Какое поле не так и что с ним не так
-      required: [field, issue]
+      description: Запрос на отправку одного уведомления (Job).
+      required: [channel, recipient, text]
       properties:
-        field:
-          type: string
-          description: Путь к некорректному полю, включая индекс элемента массива
-          example: "recipients[3].contact"
-        issue:
-          type: string
-          description: Что именно не так с полем
-          example: "must be a valid email address for channel=email"
-
-    Error:
-      type: object
-      description: Единое тело любой ошибки API
-      required: [code, message]
-      properties:
-        code:
-          $ref: '#/components/schemas/ErrorCode'
-        message:
-          type: string
-          description: Человекочитаемое описание ошибки
-        details:
-          type: array
-          description: Заполняется для `bad_request` и `validation_failed` — по одному элементу на некорректное поле
-          items:
-            $ref: '#/components/schemas/FieldError'
-        state:
-          allOf:
-            - $ref: '#/components/schemas/JobState'
-          description: Текущее состояние Job; заполняется для `409`
-        job_id:
-          type: string
-          format: uuid
-          description: id отклонённого Job; заполняется для `422` (Job сохранён в `rejected` для аудита)
-
-    Template:
-      type: object
-      description: Шаблон сообщения с плейсхолдерами `{{имя_переменной}}`
-      required: [body]
-      properties:
-        body:
+        channel:
+          $ref: '#/components/schemas/Channel'
+        recipient:
           type: string
           minLength: 1
           description: |
-            Текст сообщения. Для `channel=email` — текст письма, для
-            `channel=telegram` — текст сообщения, для `channel=webhook` —
-            JSON-тело webhook-запроса с плейсхолдерами.
-          example: "{{name}}, ваш заказ {{order_id}} собран."
-        subject:
+            Получатель в формате канала: для `email` — адрес (user@example.com),
+            для `telegram` — числовой chat id, для `webhook` — URL эндпоинта.
+        text:
           type: string
-          description: Тема письма; обязательна при `channel=email`
-          example: "Здравствуйте, {{name}}!"
-
-    Recipient:
-      type: object
-      description: Получатель и его персональные данные для подстановки в шаблон
-      required: [contact]
-      properties:
-        contact:
-          type: string
-          minLength: 3
+          minLength: 1
           description: |
-            Адрес получателя в формате канала: email при `channel=email`
-            (валидируется как email), числовой `chat_id` при
-            `channel=telegram`, https-URL при `channel=webhook`.
-          example: "user@example.com"
-        variables:
-          type: object
-          description: Имена и значения переменных для подстановки вместо плейсхолдеров шаблона
-          additionalProperties: true
-          example: { name: "Иван", order_id: "A-101" }
-
-    SendWindow:
-      type: object
+            Текст сообщения. Для `webhook` — тело POST-запроса (обычно JSON).
+    NotificationState:
+      type: string
       description: |
-        Разрешённое окно отправки по местному времени. Вне окна Job не отправляет:
-        если время запуска наступило ночью, Job переходит в `waiting_window`
-        и стартует с открытием окна.
-      required: [start, end]
-      properties:
-        start:
-          type: string
-          description: Начало окна, HH:MM
-          pattern: '^([01]\d|2[0-3]):[0-5]\d$'
-          example: "09:00"
-        end:
-          type: string
-          description: Конец окна, HH:MM; должен быть позже начала
-          pattern: '^([01]\d|2[0-3]):[0-5]\d$'
-          example: "21:00"
-        timezone:
-          type: string
-          description: Именованный часовой пояс IANA, к которому привязано окно
-          default: UTC
-          example: Europe/Moscow
-
-    RetryPolicy:
+        Состояние Job. Терминальные: `delivered`, `undelivered`, `cancelled`.
+        Машина состояний целиком — в `docs/architecture.md`.
+      enum: [accepted, sending, delivered, undelivered, cancelled]
+    FailureReason:
       type: object
-      description: Политика ограниченных повторов для одного уведомления
-      properties:
-        max_attempts:
-          type: integer
-          minimum: 1
-          maximum: 5
-          default: 3
-          description: Всего попыток отправки одного уведомления (1 — без повторов)
-        backoff_seconds:
-          type: integer
-          minimum: 1
-          default: 60
-          description: Базовая пауза между попытками; растёт экспоненциально с каждой попыткой
-
-    JobCreate:
-      type: object
-      description: Запрос на создание рассылки
-      required: [channel, template, recipients]
-      properties:
-        channel:
-          $ref: '#/components/schemas/Channel'
-        template:
-          $ref: '#/components/schemas/Template'
-        recipients:
-          type: array
-          minItems: 1
-          maxItems: 10000
-          description: |
-            Получатели рассылки. Лимит настраивается развёртыванием; сверх лимита —
-            `422` с `field: recipients`.
-          items:
-            $ref: '#/components/schemas/Recipient'
-        scheduled_at:
-          type: string
-          format: date-time
-          description: |
-            Время запуска рассылки. Если не задано — отправка как можно скорее
-            с учётом окна отправки. Значение в прошлом — `422`.
-          example: "2026-11-21T10:00:00+03:00"
-        send_window:
-          allOf:
-            - $ref: '#/components/schemas/SendWindow'
-          description: Окно отправки; по умолчанию 09:00–21:00 в часовом поясе сервиса
-        retry_policy:
-          allOf:
-            - $ref: '#/components/schemas/RetryPolicy'
-          description: Повторы; по умолчанию 3 попытки с паузой 60 секунд
-
-    JobStats:
-      type: object
-      description: Счётчики уведомлений Job по статусам; сумма равна total
-      required: [total, accepted, sending, delivered, undelivered, cancelled]
-      properties:
-        total:
-          type: integer
-          minimum: 0
-        accepted:
-          type: integer
-          minimum: 0
-        sending:
-          type: integer
-          minimum: 0
-        delivered:
-          type: integer
-          minimum: 0
-        undelivered:
-          type: integer
-          minimum: 0
-        cancelled:
-          type: integer
-          minimum: 0
-
-    Failure:
-      type: object
-      description: Причина неудачи (Job в состоянии failed или уведомление в undelivered)
+      description: Причина, по которой Job не доставлен; присутствует только в состоянии `undelivered`.
       required: [code, message]
       properties:
         code:
           type: string
-          description: Машиночитаемый код причины
-          example: storage_unavailable
+          description: |
+            Машиночитаемая причина: `provider_timeout` — таймаут канала, попытки исчерпаны;
+            `provider_rejected` — постоянная ошибка канала (адрес не существует, бот заблокирован);
+            `interrupted` — сервис перезапущен во время отправки.
+          enum: [provider_timeout, provider_rejected, interrupted]
         message:
           type: string
-          description: Человекочитаемое описание причины
-          example: "Хранилище недоступно дольше допустимого предела"
-
-    Job:
-      type: object
-      description: "Рассылка: параметры и текущее состояние"
-      required: [id, state, channel, scheduled_at, created_at, updated_at, stats]
-      properties:
-        id:
-          type: string
-          format: uuid
-        state:
-          $ref: '#/components/schemas/JobState'
-        channel:
-          $ref: '#/components/schemas/Channel'
-        scheduled_at:
-          type: string
-          format: date-time
-          description: Фактическое время запуска; равно времени создания, если клиент не задал своё
-        send_window:
-          $ref: '#/components/schemas/SendWindow'
-        retry_policy:
-          $ref: '#/components/schemas/RetryPolicy'
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
-        stats:
-          $ref: '#/components/schemas/JobStats'
-        failure:
-          allOf:
-            - $ref: '#/components/schemas/Failure'
-          description: Заполняется только при `state = failed`
-
+          description: Человекочитаемое пояснение.
     Notification:
       type: object
-      description: Одно уведомление внутри Job
-      required: [id, job_id, status, contact, attempts]
+      description: |
+        Job — одно уведомление. Поле `error` присутствует только в состоянии `undelivered`.
+      required: [id, state, channel, recipient, attempts, created_at, updated_at]
       properties:
         id:
           type: string
           format: uuid
-        job_id:
+          description: Идентификатор Job.
+        state:
+          $ref: '#/components/schemas/NotificationState'
+        channel:
+          $ref: '#/components/schemas/Channel'
+        recipient:
           type: string
-          format: uuid
-        status:
-          $ref: '#/components/schemas/NotificationStatus'
-        contact:
-          type: string
-          description: Адрес получателя в формате канала
-          example: "user@example.com"
+          description: Получатель в формате канала.
         attempts:
           type: integer
           minimum: 0
-          description: Сколько попыток отправки уже сделано
-        last_attempt_at:
+          maximum: 3
+          description: Число выполненных попыток отправки; максимум 3.
+        error:
+          $ref: '#/components/schemas/FailureReason'
+        created_at:
           type: string
           format: date-time
-          nullable: true
-          description: Время последней попытки; null, если попыток ещё не было
-        delivered_at:
+          description: Время создания Job.
+        updated_at:
           type: string
           format: date-time
-          nullable: true
-          description: Время подтверждения доставки провайдером; null, если не доставлено
-        failure:
-          allOf:
-            - $ref: '#/components/schemas/Failure'
-          description: Заполняется только при `status = undelivered`
-
-    NotificationList:
+          description: Время последнего изменения.
+    Error:
       type: object
-      description: Страница списка уведомлений
-      required: [items, total]
+      description: Единый формат ошибок для всех операций.
+      required: [code, message]
       properties:
-        items:
+        code:
+          type: string
+          description: Машиночитаемый код ошибки.
+          enum: [bad_request, unknown_channel, invalid_params, missing_idempotency_key, notification_not_found, cannot_cancel, idempotency_conflict, internal_error]
+        message:
+          type: string
+          description: Человекочитаемое описание.
+        details:
           type: array
+          description: Присутствует только при `invalid_params`; по элементу на каждое некорректное поле.
           items:
-            $ref: '#/components/schemas/Notification'
-        total:
-          type: integer
-          minimum: 0
-          description: Общее число уведомлений Job, удовлетворяющее фильтру
-
-    Health:
+            type: object
+            required: [field, issue]
+            properties:
+              field:
+                type: string
+                description: Имя некорректного поля.
+              issue:
+                type: string
+                description: Что именно не так с полем.
+    HealthStatus:
       type: object
-      description: Ответ проверки живости
+      description: Ответ проверки живости.
       required: [status]
       properties:
         status:
           type: string
           enum: [ok, degraded]
-          description: "`ok` — сервис работает; `degraded` — процесс жив, но внутренние зависимости недоступны"
-        version:
-          type: string
-          description: Версия сервиса
-          example: "1.0.0"
