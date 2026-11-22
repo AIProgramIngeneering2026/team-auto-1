@@ -8,6 +8,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from notifications.errors import InvalidParamsError
+
 # ---------------------------------------------------------------- Типы
 
 
@@ -51,6 +53,21 @@ class ToolError:
     kind: str  # "transient" | "permanent"
     message: str
     retry_after_seconds: int | None = None  # только для rate_limited
+
+
+#: Коды, которыми Tool вправе отказывать (tool-contract.md, раздел 2).
+#: ``interrupted`` сюда не входит: его ставит Dispatcher, а не Tool.
+TOOL_ERROR_CODES = frozenset(
+    {
+        "provider_timeout",
+        "provider_unavailable",
+        "rate_limited",
+        "bad_provider_response",
+        "recipient_rejected",
+        "invalid_params",
+        "internal_error",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -102,3 +119,30 @@ class Tool(ABC):
     @abstractmethod
     def send(self, request: SendRequest) -> ToolResult:
         """Одна попытка отправки через адаптер."""
+
+    def ensure_valid(self, params: SendParams) -> None:
+        """Проверка для вызывающего (входной слой, tool-contract.md §3).
+
+        Неверные параметры -> InvalidParamsError с указанием поля
+        (``err.field`` — поле первой ошибки, ``err.details`` — все).
+        Правила знает Tool, а применить их до отправки обязан вызывающий.
+        """
+        errors = self.validate(params)
+        if errors:
+            raise InvalidParamsError(errors)
+
+
+def invalid_params_failure(errors: list[FieldError]) -> Failure:
+    """Ответ ``send()`` на параметры, не прошедшие validate() (защитная проверка).
+
+    Постоянная ошибка (повтор бессмыслен). В сообщении — только имена полей и
+    коды, без текста сообщения (контракт Tool, раздел 4, правило 5).
+    """
+    fields = ", ".join(f"{e.field} ({e.code})" for e in errors)
+    return Failure(
+        ToolError(
+            code="invalid_params",
+            kind="permanent",
+            message=f"параметры не прошли проверку: {fields}",
+        )
+    )

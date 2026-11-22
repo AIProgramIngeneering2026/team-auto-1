@@ -5,14 +5,13 @@ from __future__ import annotations
 from urllib.parse import urlparse
 
 from notifications.tools.base import (
-    Failure,
     FieldError,
     ProviderAdapter,
     SendParams,
     SendRequest,
     Tool,
-    ToolError,
     ToolResult,
+    invalid_params_failure,
 )
 
 _MAX_RECIPIENT = 2048
@@ -53,7 +52,7 @@ class WebhookTool(Tool):
         # subject: не используется
 
         # text: обязателен, 1..65 536 символов
-        if not params.text:
+        if not params.text.strip():
             errors.append(FieldError("text", "required", "текст обязателен"))
         elif len(params.text) > _MAX_TEXT:
             errors.append(
@@ -63,12 +62,7 @@ class WebhookTool(Tool):
         return errors
 
     def send(self, request: SendRequest) -> ToolResult:
-        if self.validate(request.params):
-            return Failure(
-                ToolError(
-                    code="invalid_params",
-                    kind="permanent",
-                    message="параметры не прошли проверку WebhookTool",
-                )
-            )
+        errors = self.validate(request.params)
+        if errors:
+            return invalid_params_failure(errors)
         return self._adapter.deliver(self.channel, request)

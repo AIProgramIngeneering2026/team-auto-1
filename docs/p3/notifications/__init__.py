@@ -3,10 +3,11 @@
 Правила переходов состояний Job (диаграмма состояний из практики 2) живут
 внутри класса Job. Registry выдаёт Tool по имени операции; неизвестная
 операция — явная ошибка UnknownOperationError (код ``unknown_operation``).
-Хранение — через интерфейс (``store``), реализация в памяти.
 """
 
+from notifications.dispatcher import Dispatcher, RetryPolicy
 from notifications.errors import (
+    InvalidParamsError,
     InvalidTransitionError,
     JobNotFoundError,
     NotificationError,
@@ -14,14 +15,18 @@ from notifications.errors import (
 )
 from notifications.job import Job, JobState
 from notifications.registry import Registry
-from notifications.store import InMemoryJobStore
+from notifications.repository import InMemoryJobRepository, JobRepository
 
 __all__ = [
     "Job",
     "JobState",
     "Registry",
-    "InMemoryJobStore",
+    "Dispatcher",
+    "RetryPolicy",
+    "JobRepository",
+    "InMemoryJobRepository",
     "InvalidTransitionError",
+    "InvalidParamsError",
     "UnknownOperationError",
     "JobNotFoundError",
     "NotificationError",

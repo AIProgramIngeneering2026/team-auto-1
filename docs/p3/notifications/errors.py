@@ -56,10 +56,33 @@ class UnknownOperationError(NotificationError):
 
 
 class JobNotFoundError(NotificationError):
-    """Job с таким id не существует (сценарий С2: 404 notification_not_found)."""
+    """Job с таким id нет в хранилище (в API это 404 notification_not_found)."""
 
     code = "notification_not_found"
 
     def __init__(self, job_id: str) -> None:
         self.job_id = job_id
         super().__init__(f"уведомление не найдено: {job_id!r}")
+
+
+class InvalidParamsError(NotificationError):
+    """Неверные параметры Tool: код ``invalid_params`` и указание поля.
+
+    Строится из результата ``Tool.validate()`` (список ``FieldError``).
+    Поле ``field`` берётся из ПЕРВОЙ ошибки, как требует tool-contract.md
+    (раздел 3); ``details`` — по элементу на каждое неверное поле, в формате
+    ``details`` из openapi.yaml (``field`` + ``issue``).
+    """
+
+    code = "invalid_params"
+
+    def __init__(self, field_errors) -> None:
+        if not field_errors:
+            raise ValueError("InvalidParamsError требует хотя бы одну ошибку поля")
+        self.field_errors = list(field_errors)
+        self.field: str = self.field_errors[0].field
+        self.details = [
+            {"field": e.field, "issue": e.message} for e in self.field_errors
+        ]
+        fields = ", ".join(f"{e.field} ({e.code})" for e in self.field_errors)
+        super().__init__(f"неверные параметры: {fields}")
