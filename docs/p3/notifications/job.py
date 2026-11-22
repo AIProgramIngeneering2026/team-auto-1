@@ -21,6 +21,15 @@ interrupt / cancel), каждый из которых проверяет пер�
 атрибуты ``id``/``channel``/``recipient``/``text`` после создания не
 меняются (Job неизменяем после создания — см. таблицу запрещённых
 переходов в architecture.md).
+
+Восстановление сохранённого Job — ``Job._rehydrate()`` — внутренний
+метод для слоя хранения (store): он проверяет не только формат, но и
+инварианты «физически возможной истории» (успех ⇒ была попытка, attempts
+в пределах 1..MAX, error только у undelivered и только из
+допустимых кодов). Само же «воскрешение» — восстановление Job, уже
+находящегося в терминальном состоянии, с другим состоянием — отклоняет
+хранилище (см. notifications/store.py): там один Job на id и условная
+запись, как условный UPDATE в ADR-0001.
 """
 
 from __future__ import annotations
@@ -29,6 +38,24 @@ from dataclasses import dataclass
 from enum import Enum
 
 from notifications.errors import InvalidTransitionError
+
+#: Максимум попыток отправки (requirements.md, С5: «до 3 попыток»).
+MAX_ATTEMPTS = 3
+
+#: Коды, которые могут оказаться в поле error Job (tool-contract.md, раздел 2;
+#: совпадает с enum FailureReason в docs/api/openapi.yaml).
+ALLOWED_ERROR_CODES = frozenset(
+    {
+        "provider_timeout",
+        "provider_unavailable",
+        "rate_limited",
+        "bad_provider_response",
+        "recipient_rejected",
+        "invalid_params",
+        "interrupted",
+        "internal_error",
+    }
+)
 
 
 class JobState(str, Enum):
@@ -133,8 +160,9 @@ class Job:
 
         Подсунуть состояние через конструктор нельзя — иначе машина
         состояний обходилась бы без проверки переходов. Восстановить
-        сохранённый Job из хранилища можно только через ``Job.rehydrate()``
-        (ниже), а перевести в другое состояние — только методами-событиями.
+        сохранённый Job из хранилища можно только через слой хранения
+        (``InMemoryJobStore.restore`` -> ``Job._rehydrate``), а перевести
+        в другое состояние — только методами-событиями.
         """
         if not job_id or not channel or not recipient or not text:
             raise ValueError(
@@ -150,7 +178,7 @@ class Job:
         self._provider_message_id: str | None = None
 
     @classmethod
-    def rehydrate(
+    def _rehydrate(
         cls,
         job_id: str,
         channel: str,
@@ -161,13 +189,25 @@ class Job:
         error: str | None = None,
         provider_message_id: str | None = None,
     ) -> "Job":
-        """Восстановить Job из хранилища (snapshot, не переход).
+        """Восстановить Job из снимка хранилища. ВНУТРЕННИЙ метод.
 
-        Единственная точка, где состояние задаётся напрямую — и она
-        предназначена для чтения сохранённого Job (персистентность,
-        GET /notifications/{id}), а не для смены состояний. Восстановленный
-        объект дальше живёт по тем же правилам: меняется только событиями,
-        запрещённые переходы дают InvalidTransitionError.
+        Точка входа для слоя хранения — ``InMemoryJobStore.restore()``;
+        напрямую из вызывающего кода восстановление не вызывается.
+        Снимок обязан быть физически возможной историей Job — иначе
+        ValueError (защита от злодейств З3–З6 через поддельный снимок):
+
+        - accepted: attempts = 0, error = None;
+        - sending: 1 <= attempts <= MAX, error = None (работа идёт);
+        - delivered: attempts >= 1 (успех без работы невозможен — З5),
+          error = None, provider_message_id может отсутствовать;
+        - undelivered: attempts >= 1, error обязателен и только из
+          ALLOWED_ERROR_CODES, provider_message_id = None;
+        - cancelled: attempts = 0 (отмена только из accepted — З3),
+          error = None.
+
+        Гарантию «тот же id не воскресает в другом состоянии» даёт
+        store.restore(): для уже известного id допустим только
+        идентичный снимок.
         """
         if not job_id or not channel or not recipient or not text:
             raise ValueError(
@@ -177,13 +217,75 @@ class Job:
             raise ValueError(
                 f"state должно быть JobState, получено {state!r}"
             )
-        if attempts < 0:
-            raise ValueError(f"attempts не может быть отрицательным: {attempts}")
-        if state is JobState.UNDELIVERED and not error:
+        if not isinstance(attempts, int) or isinstance(attempts, bool):
+            raise ValueError(f"attempts должно быть int, получено {attempts!r}")
+
+        if attempts > MAX_ATTEMPTS:
             raise ValueError(
-                "восстановление undelivered без причины ошибки запрещено "
-                "(клиент должен видеть причину в error)"
+                f"attempts не может превышать {MAX_ATTEMPTS}: {attempts}"
             )
+
+        if state is JobState.ACCEPTED:
+            if attempts != 0:
+                raise ValueError(
+                    "accepted без начатой отправки: attempts должен быть 0"
+                )
+            if error is not None or provider_message_id is not None:
+                raise ValueError(
+                    "accepted не может иметь error или provider_message_id"
+                )
+
+        elif state is JobState.SENDING:
+            if attempts < 1:
+                raise ValueError(
+                    "sending означает начатую отправку: attempts должен быть >= 1"
+                )
+            if error is not None or provider_message_id is not None:
+                raise ValueError(
+                    "sending не может иметь error или provider_message_id"
+                )
+
+        elif state is JobState.DELIVERED:
+            if attempts < 1:
+                raise ValueError(
+                    "delivered без единой попытки — успех без работы невозможен"
+                )
+            if error is not None:
+                raise ValueError(
+                    "delivered не может иметь error (причина есть только у неудачи)"
+                )
+
+        elif state is JobState.UNDELIVERED:
+            if attempts < 1:
+                raise ValueError(
+                    "undelivered без единой попытки невозможен"
+                )
+            if not error:
+                raise ValueError(
+                    "восстановление undelivered без причины ошибки запрещено "
+                    "(клиент должен видеть причину в error)"
+                )
+            if error not in ALLOWED_ERROR_CODES:
+                raise ValueError(
+                    f"недопустимый код ошибки: {error!r}; допустимы: "
+                    f"{', '.join(sorted(ALLOWED_ERROR_CODES))}"
+                )
+            if provider_message_id is not None:
+                raise ValueError(
+                    "undelivered не может иметь provider_message_id"
+                )
+
+        elif state is JobState.CANCELLED:
+            if attempts != 0:
+                raise ValueError(
+                    "отмена возможна только из accepted (до начала отправки): "
+                    "attempts должен быть 0"
+                )
+            if error is not None or provider_message_id is not None:
+                raise ValueError(
+                    "cancelled не может иметь error или provider_message_id"
+                )
+
         job = cls(job_id, channel, recipient, text)
         job._state = state
         job._attempts = attempts
@@ -270,9 +372,18 @@ class Job:
     def record_retry(self) -> None:
         """Временная ошибка канала: sending -> sending, attempts + 1.
 
-        Стратегию повторов (сколько попыток всего, паузы между ними) решает
-        Dispatcher — здесь фиксируется сам факт повторной попытки.
+        Стратегию повторов (когда, с какой паузой) решает Dispatcher, но
+        предел — общий инвариант Job: всего не больше MAX_ATTEMPTS (3).
+        После исчерпания попыток повтор отклоняется явной ошибкой — Job
+        обязан уйти в undelivered (fail) или быть прерван (interrupt),
+        «вечная работа» (З2) и неограниченные повторы исключены.
         """
+        if self._attempts >= MAX_ATTEMPTS:
+            raise InvalidTransitionError(
+                from_state=self._state.value,
+                to_state=JobState.SENDING.value,
+                event="retry",
+            )
         self._apply("retry")
         self._attempts += 1
 

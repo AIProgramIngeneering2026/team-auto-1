@@ -53,3 +53,13 @@ class UnknownOperationError(NotificationError):
         self.known = list(known) if known else []
         hint = f", известные операции: {', '.join(self.known)}" if self.known else ""
         super().__init__(f"неизвестная операция: {operation!r}{hint}")
+
+
+class JobNotFoundError(NotificationError):
+    """Job с таким id не существует (сценарий С2: 404 notification_not_found)."""
+
+    code = "notification_not_found"
+
+    def __init__(self, job_id: str) -> None:
+        self.job_id = job_id
+        super().__init__(f"уведомление не найдено: {job_id!r}")
