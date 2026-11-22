@@ -5,17 +5,16 @@ from __future__ import annotations
 import re
 
 from notifications.tools.base import (
-    Failure,
     FieldError,
     ProviderAdapter,
     SendParams,
     SendRequest,
     Tool,
-    ToolError,
     ToolResult,
+    invalid_params_failure,
 )
 
-_CHAT_ID_RE = re.compile(r"^-?\d+$")
+_CHAT_ID_RE = re.compile(r"-?[0-9]+")  # только ASCII-цифры (\d принял бы и ١٢٣)
 _MAX_TEXT = 4096  # лимит Telegram
 
 
@@ -35,7 +34,7 @@ class TelegramTool(Tool):
             errors.append(
                 FieldError("recipient", "required", "получатель обязателен")
             )
-        elif not _CHAT_ID_RE.match(params.recipient):
+        elif not _CHAT_ID_RE.fullmatch(params.recipient):
             errors.append(
                 FieldError(
                     "recipient",
@@ -47,7 +46,7 @@ class TelegramTool(Tool):
         # subject: не используется, игнорируется (в том числе невалидный)
 
         # text: обязателен, 1..4096 символов
-        if not params.text:
+        if not params.text.strip():
             errors.append(FieldError("text", "required", "текст обязателен"))
         elif len(params.text) > _MAX_TEXT:
             errors.append(
@@ -57,12 +56,7 @@ class TelegramTool(Tool):
         return errors
 
     def send(self, request: SendRequest) -> ToolResult:
-        if self.validate(request.params):
-            return Failure(
-                ToolError(
-                    code="invalid_params",
-                    kind="permanent",
-                    message="параметры не прошли проверку TelegramTool",
-                )
-            )
+        errors = self.validate(request.params)
+        if errors:
+            return invalid_params_failure(errors)
         return self._adapter.deliver(self.channel, request)
